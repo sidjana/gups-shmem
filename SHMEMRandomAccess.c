@@ -160,6 +160,7 @@
 #include <stdio.h>
 #include "RandomAccess.h"
 #include <shmem.h>
+#include <shmemx.h>
 #define MAXTHREADS 256
 #define CHUNK    1
 #define CHUNKBIG (32*CHUNK)
@@ -175,10 +176,10 @@ u64Int srcBuf[] = {
 };
 u64Int targetBuf[sizeof(srcBuf) / sizeof(u64Int)];
 
-static s64Int count[MAXTHREADS];
-s64Int updates[MAXTHREADS][MAXTHREADS];
 static s64Int ran;
+int nlocalm1;
 
+#define hid_UPDATE_HPCC_TABLE 100
 void
 Power2NodesRandomAccessUpdate(u64Int logTableSize,
                                  u64Int TableSize,
@@ -194,7 +195,7 @@ Power2NodesRandomAccessUpdate(u64Int logTableSize,
 {
   int i,j,k;
   int logTableLocal,ipartner,iterate,niterate;
-  int ndata,nkeep,nsend,nrecv,index,nlocalm1;
+  int ndata,nkeep,nsend,nrecv,index;
   int numthrds;
   u64Int datum,procmask;
   u64Int *data,*send;
@@ -202,14 +203,9 @@ Power2NodesRandomAccessUpdate(u64Int logTableSize,
   int remote_proc, offset;
   u64Int *tb;
   s64Int remotecount;
-  int thisPeId;
   int numNodes;
-  int count2;
 
-  thisPeId = shmem_my_pe();
   numNodes = shmem_n_pes();
-  shmem_barrier_all();
-
 
   /* setup: should not really be part of this timed routine */
   ran = starts(4*GlobalStartMyProc);
@@ -218,44 +214,32 @@ Power2NodesRandomAccessUpdate(u64Int logTableSize,
   logTableLocal = logTableSize - logNumProcs;
   nlocalm1 = LocalTableSize - 1;
 
-  for (i = 0; i < numNodes; i++)
-      for (j = 0; j < MAXTHREADS; j++)
-        updates[i][j] = 0;
-
-  for (i = 0; i < numNodes; i++)
-    count[i] = 0;
-
   shmem_barrier_all();
-
+ 
   for (iterate = 0; iterate < niterate; iterate++) {
       ran = (ran << 1) ^ ((s64Int) ran < ZERO64B ? POLY : ZERO64B);
       remote_proc = (ran >> logTableLocal) & (numNodes - 1);
-      remotecount = shmem_longlong_fadd(&count[thisPeId], 1, remote_proc);
-      shmem_longlong_p(&updates[thisPeId][remotecount], ran, remote_proc);
-
-      shmem_barrier_all();
-
-      for(i = 0; i < numNodes; i++){
-        count2 = 0;
-        while (count[i]){
-          datum = updates[i][count2];
-          index = datum & nlocalm1;
-          HPCC_Table[index] ^= datum;
-          updates[i][count2] = 0;
-          count2++;
-          count[i]--;
-        }
-      }
-
-      shmem_barrier_all();
+      shmemx_am_request(remote_proc, hid_UPDATE_HPCC_TABLE,
+		        &ran, sizeof(s64Int) );
+      shmemx_am_quiet();
   }
-
   shmem_barrier_all();
-
 }
 
-HPCC_Params params;
 
+shmemx_am_mutex hpcc_lock;
+
+void handler_update_HPCCTable(void *ran, size_t nbytes, int req_pe, shmemx_am_token_t token)
+{
+	  s64Int datum = *(s64Int*)ran;
+          int index = datum & nlocalm1;
+	  shmemx_am_mutex_lock(&hpcc_lock);
+          HPCC_Table[index] ^= datum;
+	  shmemx_am_mutex_unlock(&hpcc_lock);
+}
+
+
+HPCC_Params params;
 int main(int argc, char **argv)
 {
   int myRank, commSize;
@@ -263,7 +247,10 @@ int main(int argc, char **argv)
   int provided;
 
   shmem_init();
+  shmemx_am_mutex_init(&hpcc_lock);
+  shmemx_am_attach(hid_UPDATE_HPCC_TABLE, &handler_update_HPCCTable);
   HPCC_SHMEMRandomAccess( &params );
+  shmemx_am_mutex_destroy(&hpcc_lock);
   shmem_finalize();
 
   return 0;
